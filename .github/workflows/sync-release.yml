@@ -1,0 +1,75 @@
+name: Sync update release
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/sync-release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download current update files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          mirrors=(
+            "https://hosting-three-ashy.vercel.app/updates"
+            "https://fsb-script-updates.netlify.app/updates"
+          )
+          download_file() {
+            local name="$1"
+            for base in "${mirrors[@]}"; do
+              if curl -fL --retry 3 --connect-timeout 15 --max-time 120 "$base/$name" -o "release-assets/$name"; then
+                return 0
+              fi
+            done
+            echo "Failed to download $name" >&2
+            return 1
+          }
+          for name in latest.ini script.exe install.exe 2.mp3 bind.txt; do
+            download_file "$name"
+          done
+
+      - name: Read release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -a '^version=' release-assets/latest.ini | head -n1 | cut -d= -f2- | tr -d '\r')
+          if [ -z "$version" ]; then
+            echo "latest.ini has no version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "TAG=v$version" >> "$GITHUB_ENV"
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import base64
+          from pathlib import Path
+          notes = ''
+          for raw_line in Path('release-assets/latest.ini').read_bytes().splitlines():
+              line = raw_line.decode('ascii', errors='ignore')
+              if line.startswith('notes_b64='):
+                  notes = base64.b64decode(line.split('=', 1)[1]).decode('utf-8', errors='replace')
+                  break
+          print('NOTES<<EOF')
+          print(notes or 'Update release')
+          print('EOF')
+          PY
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes "$NOTES" --latest
+            gh release upload "$TAG" release-assets/latest.ini release-assets/script.exe release-assets/install.exe release-assets/2.mp3 release-assets/bind.txt --clobber
+          else
+            gh release create "$TAG" release-assets/latest.ini release-assets/script.exe release-assets/install.exe release-assets/2.mp3 release-assets/bind.txt --title "$TAG" --notes "$NOTES" --latest
+          fi
