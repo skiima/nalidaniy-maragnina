@@ -63,13 +63,89 @@ jobs:
 
       - name: Publish GitHub Release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TAG" --notes "$NOTES" --latest
-            gh release upload "$TAG" release-assets/latest.ini release-assets/script.exe release-assets/install.exe release-assets/2.mp3 release-assets/bind.txt --clobber
-          else
-            gh release create "$TAG" release-assets/latest.ini release-assets/script.exe release-assets/install.exe release-assets/2.mp3 release-assets/bind.txt --title "$TAG" --notes "$NOTES" --latest
-          fi
+          python3 - <<'PY'
+          import json
+          import mimetypes
+          import os
+          import pathlib
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ['GITHUB_TOKEN']
+          repo = os.environ['GITHUB_REPOSITORY']
+          tag = os.environ['TAG']
+          notes = os.environ.get('NOTES', 'Update release')
+          api = f'https://api.github.com/repos/{repo}'
+          headers = {
+              'Authorization': f'Bearer {token}',
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'release-sync-workflow',
+          }
+
+          def request(method, url, body=None, extra_headers=None):
+              data = None
+              req_headers = dict(headers)
+              if extra_headers:
+                  req_headers.update(extra_headers)
+              if body is not None:
+                  if isinstance(body, (dict, list)):
+                      data = json.dumps(body).encode('utf-8')
+                      req_headers['Content-Type'] = 'application/json; charset=utf-8'
+                  else:
+                      data = body
+              req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      payload = response.read()
+                      if not payload:
+                          return None
+                      return json.loads(payload.decode('utf-8'))
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return {'_missing': True}
+                  detail = error.read().decode('utf-8', errors='replace')
+                  raise RuntimeError(f'{method} {url} failed: {error.code} {detail}') from error
+
+          release = request('GET', f'{api}/releases/tags/{urllib.parse.quote(tag)}')
+          release_body = {
+              'tag_name': tag,
+              'name': tag,
+              'body': notes,
+              'draft': False,
+              'prerelease': False,
+              'make_latest': 'true',
+          }
+          if release and release.get('_missing'):
+              release = request('POST', f'{api}/releases', release_body)
+          else:
+              release = request('PATCH', f"{api}/releases/{release['id']}", release_body)
+
+          wanted = ['latest.ini', 'script.exe', 'install.exe', '2.mp3', 'bind.txt']
+          assets = request('GET', f"{api}/releases/{release['id']}/assets?per_page=100") or []
+          for asset in assets:
+              if asset.get('name') in wanted:
+                  request('DELETE', f"{api}/releases/assets/{asset['id']}")
+
+          upload_base = release['upload_url'].split('{', 1)[0]
+          content_types = {
+              'latest.ini': 'text/plain; charset=windows-1251',
+              'script.exe': 'application/vnd.microsoft.portable-executable',
+              'install.exe': 'application/vnd.microsoft.portable-executable',
+              '2.mp3': 'audio/mpeg',
+              'bind.txt': 'text/plain; charset=utf-8',
+          }
+          for name in wanted:
+              path = pathlib.Path('release-assets') / name
+              body = path.read_bytes()
+              upload_url = f'{upload_base}?name={urllib.parse.quote(name)}'
+              request('POST', upload_url, body, {'Content-Type': content_types.get(name, 'application/octet-stream')})
+              print(f'Uploaded {name}')
+
+          print(f'Published release {tag}')
+          PY
